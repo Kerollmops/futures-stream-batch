@@ -7,16 +7,13 @@ use core::mem;
 use core::pin::Pin;
 use futures::stream::{Fuse, FusedStream, Stream};
 use futures::task::{Context, Poll};
-use futures::StreamExt;
-#[cfg(feature = "sink")]
-use futures_sink::Sink;
+use futures::{StreamExt, FutureExt};
+use futures::future::OptionFuture;
 use pin_utils::{unsafe_pinned, unsafe_unpinned};
 
-use futures01::Async;
-use std::time::{Duration, Instant};
-use tokio::prelude::Future;
-use tokio::timer::Delay;
-//
+use std::time::Duration;
+use futures_timer::Delay;
+
 impl<T: ?Sized> ChunksTimeoutStreamExt for T where T: Stream {}
 
 pub trait ChunksTimeoutStreamExt: Stream {
@@ -27,7 +24,6 @@ pub trait ChunksTimeoutStreamExt: Stream {
         ChunksTimeout::new(self, capacity, duration)
     }
 }
-//
 
 #[derive(Debug)]
 #[must_use = "streams do nothing unless polled"]
@@ -36,7 +32,7 @@ pub struct ChunksTimeout<St: Stream> {
     items: Vec<St::Item>,
     cap: usize,
     // https://github.com/rust-lang-nursery/futures-rs/issues/1475
-    clock: Option<Delay>,
+    clock: OptionFuture<Delay>,
     duration: Duration,
 }
 
@@ -47,7 +43,7 @@ where
     St: Stream,
 {
     unsafe_unpinned!(items: Vec<St::Item>);
-    unsafe_unpinned!(clock: Option<Delay>);
+    unsafe_unpinned!(clock: OptionFuture<Delay>);
     unsafe_pinned!(stream: Fuse<St>);
 
     pub fn new(stream: St, capacity: usize, duration: Duration) -> ChunksTimeout<St> {
@@ -57,7 +53,7 @@ where
             stream: stream.fuse(),
             items: Vec::with_capacity(capacity),
             cap: capacity,
-            clock: None,
+            clock: OptionFuture::from(None),
             duration,
         }
     }
@@ -112,12 +108,11 @@ impl<St: Stream> Stream for ChunksTimeout<St> {
                     // the full one.
                     Some(item) => {
                         if self.items.is_empty() {
-                            *self.as_mut().clock() =
-                                Some(Delay::new(Instant::now() + self.duration));
+                            *self.as_mut().clock() = Some(Delay::new(self.duration)).into();
                         }
                         self.as_mut().items().push(item);
                         if self.items.len() >= self.cap {
-                            *self.as_mut().clock() = None;
+                            *self.as_mut().clock() = None.into();
                             return Poll::Ready(Some(self.as_mut().take()));
                         } else {
                             // Continue the loop
@@ -131,36 +126,30 @@ impl<St: Stream> Stream for ChunksTimeout<St> {
                         let last = if self.items.is_empty() {
                             None
                         } else {
-                            let full_buf = mem::replace(self.as_mut().items(), Vec::new());
-                            Some(full_buf)
+                            Some(mem::replace(self.as_mut().items(), Vec::new()))
                         };
 
                         return Poll::Ready(last);
                     }
                 },
-                // Don't return here, as we need to need check the clock.
-                Poll::Pending => {}
+                // Don't return here, as we need to check the clock.
+                Poll::Pending => (),
             }
 
-            match self.as_mut().clock().poll() {
-                Ok(Async::Ready(Some(()))) => {
-                    *self.as_mut().clock() = None;
+            match self.as_mut().clock().poll_unpin(cx) {
+                Poll::Ready(Some(())) => {
+                    *self.as_mut().clock() = None.into();
                     return Poll::Ready(Some(self.as_mut().take()));
                 }
-                Ok(Async::Ready(None)) => {
+                Poll::Ready(None) => {
                     debug_assert!(
                         self.as_mut().items().is_empty(),
                         "Inner buffer is empty, but clock is available."
                     );
                 }
-                Ok(Async::NotReady) => {}
-                Err(_e) => {
-                    if !self.as_mut().items().is_empty() {
-                        *self.as_mut().clock() = None;
-                        return Poll::Ready(Some(self.as_mut().take()));
-                    }
-                }
+                Poll::Pending => (),
             }
+
             return Poll::Pending;
         }
     }
@@ -183,40 +172,30 @@ impl<St: FusedStream> FusedStream for ChunksTimeout<St> {
     }
 }
 
-// Forwarding impl of Sink from the underlying stream
-#[cfg(feature = "sink")]
-impl<S, Item> Sink<Item> for ChunksTimeout<S>
-where
-    S: Stream + Sink<Item>,
-{
-    type Error = S::Error;
-
-    delegate_sink!(stream, Item);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::compat::Future01CompatExt;
-    use futures::future;
-    use futures::{stream, FutureExt, StreamExt, TryFutureExt};
     use std::iter;
     use std::time::{Duration, Instant};
+    use futures::executor::ThreadPool;
+    use futures::future;
+    use futures::{stream, FutureExt, StreamExt};
 
     #[test]
     fn messages_pass_through() {
         let v = stream::iter(iter::once(5))
             .chunks_timeout(5, Duration::new(1, 0))
             .collect::<Vec<_>>();
-        tokio::run(
+
+        ThreadPool::new().unwrap().run(
             v.then(|x| {
                 assert_eq!(vec![vec![5]], x);
                 future::ready(())
             })
             .unit_error()
             .boxed()
-            .compat(),
-        );
+        )
+        .unwrap()
     }
 
     #[test]
@@ -227,15 +206,15 @@ mod tests {
         let chunk_stream = ChunksTimeout::new(stream, 5, Duration::new(1, 0));
 
         let v = chunk_stream.collect::<Vec<_>>();
-        tokio::run(
+        ThreadPool::new().unwrap().run(
             v.then(|res| {
                 assert_eq!(vec![vec![0, 1, 2, 3, 4], vec![5, 6, 7, 8, 9]], res);
                 future::ready(())
             })
             .unit_error()
             .boxed()
-            .compat(),
-        );
+        )
+        .unwrap()
     }
 
     #[test]
@@ -246,15 +225,15 @@ mod tests {
         let chunk_stream = ChunksTimeout::new(stream, 5, Duration::new(1, 0));
 
         let v = chunk_stream.collect::<Vec<_>>();
-        tokio::run(
+        ThreadPool::new().unwrap().run(
             v.then(|res| {
                 assert_eq!(vec![vec![1, 2, 3, 4]], res);
                 future::ready(())
             })
             .unit_error()
             .boxed()
-            .compat(),
-        );
+        )
+        .unwrap()
     }
 
     // TODO: use the `tokio-test` and `futures-test-preview` crates
@@ -265,9 +244,7 @@ mod tests {
 
         let iter = vec![5].into_iter();
         let stream1 = stream::iter(iter).then(move |n| {
-            Delay::new(Instant::now() + Duration::from_millis(300))
-                .compat()
-                .map(move |_| n)
+            Delay::new(Duration::from_millis(300)).map(move |_| n)
         });
 
         let iter = vec![6, 7, 8].into_iter();
@@ -293,14 +270,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        tokio::run(
+        ThreadPool::new().unwrap().run(
             v.then(move |res| {
                 assert_eq!(res, results);
                 future::ready(())
             })
             .unit_error()
             .boxed()
-            .compat(),
-        );
+        )
+        .unwrap()
     }
 }
